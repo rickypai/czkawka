@@ -19,6 +19,7 @@ use crate::common_items::ExcludedItems;
 use crate::common_messages::Messages;
 use crate::common_traits::*;
 use directories_next::ProjectDirs;
+use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*;
 use std::hash::Hasher;
 use std::io::{BufReader, BufWriter};
@@ -330,108 +331,174 @@ impl DuplicateFinder {
 
         //// PROGRESS THREAD END
 
-        while !folders_to_check.is_empty() {
-            if stop_receiver.is_some() && stop_receiver.unwrap().try_recv().is_ok() {
-                // End thread which send info to gui
-                progress_thread_run.store(false, Ordering::Relaxed);
-                progress_thread_handle.join().unwrap();
-                return false;
+        let sst: SystemTime = SystemTime::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let collect_thread = std::thread::spawn(move || {
+            let mut vec = Vec::new();
+            for path in rx {
+                vec.push(path);
             }
+            vec
+        });
 
-            let current_folder = folders_to_check.pop().unwrap();
+        let mut builder = WalkBuilder::new(&folders_to_check[0]);
+        for i in folders_to_check.iter().skip(1) {
+            builder.add(i);
+        }
+        builder.filter_entry(move |entry_data| {
+            // println!("A - {:?}", Path::new(p.file_name()).canonicalize());
+            // if Path::new(p.file_name()).to_string_lossy().to_string().contains("src") {
+            //     return false;
+            // }
+            let file_name_lowercase: String = entry_data.file_name().to_string_lossy().to_string().to_lowercase();
 
-            // Read current dir, if permission are denied just go to next
-            let read_dir = match fs::read_dir(&current_folder) {
-                Ok(t) => t,
-                Err(_) => {
-                    self.text_messages.warnings.push(format!("Cannot open dir {}", current_folder.display()));
-                    continue;
-                } // Permissions denied
-            };
-
-            // Check every sub folder/file/link etc.
-            'dir: for entry in read_dir {
-                let entry_data = match entry {
-                    Ok(t) => t,
-                    Err(_) => {
-                        self.text_messages.warnings.push(format!("Cannot read entry in dir {}", current_folder.display()));
-                        continue 'dir;
-                    } //Permissions denied
-                };
-                let metadata: Metadata = match entry_data.metadata() {
-                    Ok(t) => t,
-                    Err(_) => {
-                        self.text_messages.warnings.push(format!("Cannot read metadata in dir {}", current_folder.display()));
-                        continue 'dir;
-                    } //Permissions denied
-                };
-                if metadata.is_dir() {
-                    if !self.recursive_search {
-                        continue 'dir;
-                    }
-
-                    let next_folder = current_folder.join(entry_data.file_name());
-                    if self.directories.is_excluded(&next_folder) {
-                        continue 'dir;
-                    }
-
-                    if self.excluded_items.is_excluded(&next_folder) {
-                        continue 'dir;
-                    }
-
-                    folders_to_check.push(next_folder);
-                } else if metadata.is_file() {
-                    atomic_file_counter.fetch_add(1, Ordering::Relaxed);
-                    // let mut have_valid_extension: bool;
-                    let file_name_lowercase: String = match entry_data.file_name().into_string() {
-                        Ok(t) => t,
-                        Err(_) => continue 'dir,
-                    }
-                    .to_lowercase();
-
-                    // Checking allowed extensions
-                    if !self.allowed_extensions.file_extensions.is_empty() {
-                        let allowed = self.allowed_extensions.file_extensions.iter().any(|e| file_name_lowercase.ends_with((".".to_string() + e.to_lowercase().as_str()).as_str()));
-                        if !allowed {
-                            // Not an allowed extension, ignore it.
-                            continue 'dir;
-                        }
-                    }
-                    // Checking files
-                    if metadata.len() >= self.minimal_file_size {
-                        let current_file_name = current_folder.join(entry_data.file_name());
-                        if self.excluded_items.is_excluded(&current_file_name) {
-                            continue 'dir;
-                        }
-
-                        // Creating new file entry
-                        let fe: FileEntry = FileEntry {
-                            path: current_file_name.clone(),
-                            size: metadata.len(),
-                            modified_date: match metadata.modified() {
-                                Ok(t) => match t.duration_since(UNIX_EPOCH) {
-                                    Ok(d) => d.as_secs(),
-                                    Err(_) => {
-                                        self.text_messages.warnings.push(format!("File {} seems to be modified before Unix Epoch.", current_file_name.display()));
-                                        0
-                                    }
-                                },
-                                Err(_) => {
-                                    self.text_messages.warnings.push(format!("Unable to get modification date from file {}", current_file_name.display()));
-                                    continue 'dir;
-                                } // Permissions Denied
-                            },
-                            hash: "".to_string(),
-                        };
-
-                        // Adding files to BTreeMap
-                        self.files_with_identical_names.entry(entry_data.file_name().to_string_lossy().to_string()).or_insert_with(Vec::new);
-                        self.files_with_identical_names.get_mut(&entry_data.file_name().to_string_lossy().to_string()).unwrap().push(fe);
-                    }
+            // Checking allowed extensions
+            if !self.allowed_extensions.file_extensions.is_empty() {
+                let allowed = self.allowed_extensions.file_extensions.iter().any(|e| file_name_lowercase.ends_with((".".to_string() + e.to_lowercase().as_str()).as_str()));
+                if !allowed {
+                    // Not an allowed extension, ignore it.
+                    return false;
                 }
             }
+            let current_file_name = match Path::new(entry_data.file_name()).canonicalize() {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            if self.excluded_items.is_excluded(&current_file_name) {
+                return false;
+            }
+            return true;
+        });
+
+        builder.build_parallel().run(|| {
+            let tx = tx.clone();
+            let stop_receiver = stop_receiver.clone();
+            let progress_thread_run = progress_thread_run.clone();
+            let atomic_file_counter = atomic_file_counter.clone();
+            Box::new(move |result| {
+                atomic_file_counter.fetch_add(1, Ordering::Relaxed);
+                if stop_receiver.is_some() && stop_receiver.unwrap().try_recv().is_ok() {
+                    progress_thread_run.store(false, Ordering::Relaxed);
+                    return ignore::WalkState::Quit;
+                }
+                let r = result.unwrap().path().to_path_buf();
+                tx.send(r);
+                ignore::WalkState::Continue
+            })
+        });
+        drop(tx);
+        collect_thread.join().unwrap();
+
+        if progress_thread_run.load(Ordering::Relaxed) == false {
+            progress_thread_handle.join().unwrap();
+            return false; // User closed thread
         }
 
+        // END THREAD
+
+        // while !folders_to_check.is_empty() {
+        //     if stop_receiver.is_some() && stop_receiver.unwrap().try_recv().is_ok() {
+        //         // End thread which send info to gui
+        //         progress_thread_run.store(false, Ordering::Relaxed);
+        //         progress_thread_handle.join().unwrap();
+        //         return false;
+        //     }
+        //
+        //     let current_folder = folders_to_check.pop().unwrap();
+        //
+        //     // Read current dir, if permission are denied just go to next
+        //     let read_dir = match fs::read_dir(&current_folder) {
+        //         Ok(t) => t,
+        //         Err(_) => {
+        //             self.text_messages.warnings.push(format!("Cannot open dir {}", current_folder.display()));
+        //             continue;
+        //         } // Permissions denied
+        //     };
+        //
+        //     // Check every sub folder/file/link etc.
+        //     'dir: for entry in read_dir {
+        //         let entry_data = match entry {
+        //             Ok(t) => t,
+        //             Err(_) => {
+        //                 self.text_messages.warnings.push(format!("Cannot read entry in dir {}", current_folder.display()));
+        //                 continue 'dir;
+        //             } //Permissions denied
+        //         };
+        //         let metadata: Metadata = match entry_data.metadata() {
+        //             Ok(t) => t,
+        //             Err(_) => {
+        //                 self.text_messages.warnings.push(format!("Cannot read metadata in dir {}", current_folder.display()));
+        //                 continue 'dir;
+        //             } //Permissions denied
+        //         };
+        //         if metadata.is_dir() {
+        //             if !self.recursive_search {
+        //                 continue 'dir;
+        //             }
+        //
+        //             let next_folder = current_folder.join(entry_data.file_name());
+        //             if self.directories.is_excluded(&next_folder) {
+        //                 continue 'dir;
+        //             }
+        //
+        //             if self.excluded_items.is_excluded(&next_folder) {
+        //                 continue 'dir;
+        //             }
+        //
+        //             folders_to_check.push(next_folder);
+        //         } else if metadata.is_file() {
+        //             atomic_file_counter.fetch_add(1, Ordering::Relaxed);
+        //             // let mut have_valid_extension: bool;
+        //             let file_name_lowercase: String = match entry_data.file_name().into_string() {
+        //                 Ok(t) => t,
+        //                 Err(_) => continue 'dir,
+        //             }
+        //             .to_lowercase();
+        //
+        //             // Checking allowed extensions
+        //             if !self.allowed_extensions.file_extensions.is_empty() {
+        //                 let allowed = self.allowed_extensions.file_extensions.iter().any(|e| file_name_lowercase.ends_with((".".to_string() + e.to_lowercase().as_str()).as_str()));
+        //                 if !allowed {
+        //                     // Not an allowed extension, ignore it.
+        //                     continue 'dir;
+        //                 }
+        //             }
+        //             // Checking files
+        //             if metadata.len() >= self.minimal_file_size {
+        //                 let current_file_name = current_folder.join(entry_data.file_name());
+        //                 if self.excluded_items.is_excluded(&current_file_name) {
+        //                     continue 'dir;
+        //                 }
+        //
+        //                 // Creating new file entry
+        //                 let fe: FileEntry = FileEntry {
+        //                     path: current_file_name.clone(),
+        //                     size: metadata.len(),
+        //                     modified_date: match metadata.modified() {
+        //                         Ok(t) => match t.duration_since(UNIX_EPOCH) {
+        //                             Ok(d) => d.as_secs(),
+        //                             Err(_) => {
+        //                                 self.text_messages.warnings.push(format!("File {} seems to be modified before Unix Epoch.", current_file_name.display()));
+        //                                 0
+        //                             }
+        //                         },
+        //                         Err(_) => {
+        //                             self.text_messages.warnings.push(format!("Unable to get modification date from file {}", current_file_name.display()));
+        //                             continue 'dir;
+        //                         } // Permissions Denied
+        //                     },
+        //                     hash: "".to_string(),
+        //                 };
+        //
+        //                 // Adding files to BTreeMap
+        //                 self.files_with_identical_names.entry(entry_data.file_name().to_string_lossy().to_string()).or_insert_with(Vec::new);
+        //                 self.files_with_identical_names.get_mut(&entry_data.file_name().to_string_lossy().to_string()).unwrap().push(fe);
+        //             }
+        //         }
+        //     }
+        // }
+        let eet: SystemTime = SystemTime::now();
+        println!("SEARCHING TOOK {:?}", eet.duration_since(sst).unwrap());
         // End thread which send info to gui
         progress_thread_run.store(false, Ordering::Relaxed);
         progress_thread_handle.join().unwrap();
