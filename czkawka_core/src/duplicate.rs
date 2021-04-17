@@ -19,7 +19,7 @@ use crate::common_items::ExcludedItems;
 use crate::common_messages::Messages;
 use crate::common_traits::*;
 use directories_next::ProjectDirs;
-use ignore::{WalkBuilder, WalkState};
+use ignore::WalkBuilder;
 use rayon::prelude::*;
 use std::hash::Hasher;
 use std::io::{BufReader, BufWriter};
@@ -341,32 +341,36 @@ impl DuplicateFinder {
             vec
         });
 
+        let excluded_files = Arc::new(self.excluded_items.clone());
+        let allowed_extensions = Arc::new(self.allowed_extensions.clone());
+        println!("{:?}", self.recursive_search);
+        let recursive_search = if self.recursive_search { None } else { Some(1) };
+
         let mut builder = WalkBuilder::new(&folders_to_check[0]);
         for i in folders_to_check.iter().skip(1) {
             builder.add(i);
         }
+        builder.max_depth(recursive_search);
         builder.filter_entry(move |entry_data| {
-            // println!("A - {:?}", Path::new(p.file_name()).canonicalize());
-            // if Path::new(p.file_name()).to_string_lossy().to_string().contains("src") {
-            //     return false;
-            // }
+            // println!("B - {:?}", entry_data);
+            // println!("A - {:?}", entry_data.path().canonicalize());
             let file_name_lowercase: String = entry_data.file_name().to_string_lossy().to_string().to_lowercase();
 
-            // Checking allowed extensions
-            if !self.allowed_extensions.file_extensions.is_empty() {
-                let allowed = self.allowed_extensions.file_extensions.iter().any(|e| file_name_lowercase.ends_with((".".to_string() + e.to_lowercase().as_str()).as_str()));
-                if !allowed {
-                    // Not an allowed extension, ignore it.
-                    return false;
-                }
-            }
-            let current_file_name = match Path::new(entry_data.file_name()).canonicalize() {
-                Ok(t) => t,
-                Err(_) => return false,
-            };
-            if self.excluded_items.is_excluded(&current_file_name) {
-                return false;
-            }
+            // // Checking allowed extensions
+            // if !allowed_extensions.file_extensions.is_empty() {
+            //     let allowed = allowed_extensions.file_extensions.iter().any(|e| file_name_lowercase.ends_with((".".to_string() + e.to_lowercase().as_str()).as_str()));
+            //     if !allowed {
+            //         // Not an allowed extension, ignore it.
+            //         return false;
+            //     }
+            // }
+            // let current_file_name = match Path::new(entry_data.file_name()).canonicalize() {
+            //     Ok(t) => t,
+            //     Err(_) => return false,
+            // };
+            // if excluded_files.is_excluded(&current_file_name) {
+            //     return false;
+            // }
             return true;
         });
 
@@ -381,18 +385,90 @@ impl DuplicateFinder {
                     progress_thread_run.store(false, Ordering::Relaxed);
                     return ignore::WalkState::Quit;
                 }
-                let r = result.unwrap().path().to_path_buf();
-                tx.send(r);
+                let r = match result {
+                    Ok(t) => t.path().to_path_buf(),
+                    Err(_) => return ignore::WalkState::Continue,
+                };
+
+                tx.send(r).unwrap();
                 ignore::WalkState::Continue
             })
         });
-        drop(tx);
-        collect_thread.join().unwrap();
 
+        // Check user exited
         if progress_thread_run.load(Ordering::Relaxed) == false {
             progress_thread_handle.join().unwrap();
-            return false; // User closed thread
+            return false;
         }
+
+        drop(tx);
+        let files_to_check = collect_thread.join().unwrap();
+        println!("Number of searched files: {}", files_to_check.len());
+        // TODO Par iter needed
+        files_to_check.iter().for_each(|path_buf| {
+            if path_buf.is_dir() {
+                return;
+            }
+            let file_name_lowercase = match path_buf.file_name() {
+                Some(t) => t.to_string_lossy().to_lowercase(),
+                None => return,
+            };
+
+            // Checking allowed extensions
+            if !self.allowed_extensions.file_extensions.is_empty() {
+                let allowed = self.allowed_extensions.file_extensions.iter().any(|e| file_name_lowercase.ends_with((".".to_string() + e.to_lowercase().as_str()).as_str()));
+                if !allowed {
+                    // Not an allowed extension, ignore it.
+                    return;
+                }
+            }
+
+            let metadata = match fs::metadata(&path_buf) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+
+            // Checking files
+            if metadata.len() >= self.minimal_file_size {
+                let current_file_path = match path_buf.canonicalize() {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                let file_name = match path_buf.file_name() {
+                    Some(t) => t.to_string_lossy().to_string(),
+                    None => return,
+                };
+                // TODO Check if this is needed
+                // if self.excluded_items.is_excluded(&current_file_name) {
+                //     return;
+                // }
+
+                // Creating new file entrymatch
+                let fe: FileEntry = FileEntry {
+                    path: current_file_path.clone(),
+                    size: metadata.len(),
+                    modified_date: match metadata.modified() {
+                        Ok(t) => match t.duration_since(UNIX_EPOCH) {
+                            Ok(d) => d.as_secs(),
+                            Err(_) => {
+                                self.text_messages.warnings.push(format!("File {} seems to be modified before Unix Epoch.", current_file_path.display()));
+                                0
+                            }
+                        },
+                        Err(_) => {
+                            self.text_messages.warnings.push(format!("Unable to get modification date from file {}", current_file_path.display()));
+                            return;
+                        } // Permissions Denied
+                    },
+                    hash: "".to_string(),
+                };
+
+                // Adding files to BTreeMap
+                self.files_with_identical_names.entry(file_name.clone()).or_insert_with(Vec::new);
+                self.files_with_identical_names.get_mut(&file_name).unwrap().push(fe);
+                return;
+            }
+        });
 
         // END THREAD
 
@@ -499,7 +575,7 @@ impl DuplicateFinder {
         // }
         let eet: SystemTime = SystemTime::now();
         println!("SEARCHING TOOK {:?}", eet.duration_since(sst).unwrap());
-        // End thread which send info to gui
+        // End thread which send info to gui about it
         progress_thread_run.store(false, Ordering::Relaxed);
         progress_thread_handle.join().unwrap();
 
